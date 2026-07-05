@@ -3,13 +3,17 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/go-chi/httplog/v3"
 
 	_ "github.com/lib/pq"
 
@@ -23,71 +27,131 @@ type Puzzle struct {
 	Rating int    `json:"rating"`
 }
 
-func getRandomPuzzle(db *sql.DB) (*Puzzle, error) {
-	//                                                    Table "public.lichess_puzzles"
-	//       Column      |           Type           | Collation | Nullable | Default  | Storage  | Compression | Stats target | Description
-	// ------------------+--------------------------+-----------+----------+----------+----------+-------------+--------------+-------------
-	//  puzzle_id        | text                     |           | not null |          | extended |             |              |
-	//  fen              | text                     |           | not null |          | extended |             |              |
-	//  moves            | text                     |           | not null |          | extended |             |              |
-	//  rating           | integer                  |           | not null |          | plain    |             |              |
-	// Indexes:
-	//     "lichess_puzzles_pkey" PRIMARY KEY, btree (puzzle_id)
-	//     "lichess_puzzles_rating_idx" btree (rating)
-
-	var puzzle Puzzle
-	err := db.QueryRow("SELECT puzzle_id, fen, moves, rating FROM lichess_puzzles ORDER BY RANDOM() LIMIT 1").Scan(
-		&puzzle.ID, &puzzle.FEN, &puzzle.Moves, &puzzle.Rating)
-	if err != nil {
-		return nil, err
-	}
-
-	return &puzzle, nil
-}
-
 func main() {
 	_ = godotenv.Load()
 
-	db_url, ok := os.LookupEnv("DB_URL")
+	logger := newLogger()
+	slog.SetDefault(logger)
+
+	log.SetFlags(0)
+
+	dbURL, ok := os.LookupEnv("DB_URL")
 	if !ok {
-		log.Fatal("DB_URL not set")
+		logger.Error("DB_URL not set")
+		os.Exit(1)
 	}
-	db, err := sql.Open("postgres", db_url)
+
+	db, err := sql.Open("postgres", dbURL)
 	if err != nil {
-		log.Fatal(err)
+		logger.Error("failed to open database", slog.String("error", err.Error()))
+		os.Exit(1)
 	}
 	defer db.Close()
 
-	// db.Open() only creates a connection pool, and doesn't actually establish
-	// a connection. To ensure the connection works you need to do *something*
-	// with a connection.
-	err = db.Ping()
-	if err != nil {
-		log.Fatal(err)
+	if err := db.Ping(); err != nil {
+		logger.Error("failed to ping database", slog.String("error", err.Error()))
+		os.Exit(1)
 	}
 
 	r := chi.NewRouter()
-	r.Use(middleware.Logger)
-	r.Use(middleware.Compress(5, "application/json"))
-	r.Use(middleware.Timeout(time.Second * 30))
 
-	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("OK"))
+	r.Use(middleware.RequestID)
+	r.Use(middleware.Compress(5, "application/json"))
+	r.Use(middleware.Timeout(30 * time.Second))
+
+	r.Use(httplog.RequestLogger(logger, &httplog.Options{
+		Level:         slog.LevelInfo,
+		Schema:        httplog.SchemaECS.Concise(false),
+		RecoverPanics: true,
+	}))
+
+	r.Get("/health", handleHealth)
+	r.Get("/puzzle", handleGetPuzzle(db, logger))
+
+	addr := ":3000"
+	logger.Info("server starting", slog.String("addr", addr))
+
+	if err := http.ListenAndServe(addr, r); err != nil {
+		logger.Error("server stopped", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+}
+
+func newLogger() *slog.Logger {
+	level := slog.LevelInfo
+
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("LOG_LEVEL"))) {
+	case "debug":
+		level = slog.LevelDebug
+	case "info", "":
+		level = slog.LevelInfo
+	case "warn", "warning":
+		level = slog.LevelWarn
+	case "error":
+		level = slog.LevelError
+	}
+
+	handler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: level,
 	})
 
-	r.Get("/puzzle", func(w http.ResponseWriter, r *http.Request) {
-		puzzle, err := getRandomPuzzle(db)
+	return slog.New(handler).With(
+		slog.String("service", "chess-api"),
+	)
+}
 
+func handleHealth(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("OK"))
+}
+
+func handleGetPuzzle(db *sql.DB, logger *slog.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		puzzle, err := getRandomPuzzle(db)
 		if err != nil {
-			log.Println("Error getting random puzzle:", err)
+			httplog.SetError(r.Context(), err)
+
+			logger.ErrorContext(
+				r.Context(),
+				"failed to get random puzzle",
+				slog.String("error", err.Error()),
+			)
+
 			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 			return
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(puzzle)
-	})
 
-	http.ListenAndServe(":3000", r)
+		if err := json.NewEncoder(w).Encode(puzzle); err != nil {
+			httplog.SetError(r.Context(), err)
+
+			logger.ErrorContext(
+				r.Context(),
+				"failed to encode puzzle response",
+				slog.String("error", err.Error()),
+			)
+		}
+	}
+}
+
+func getRandomPuzzle(db *sql.DB) (*Puzzle, error) {
+	var puzzle Puzzle
+
+	err := db.QueryRow(`
+		SELECT puzzle_id, fen, moves, rating
+		FROM lichess_puzzles
+		ORDER BY RANDOM()
+		LIMIT 1
+	`).Scan(
+		&puzzle.ID,
+		&puzzle.FEN,
+		&puzzle.Moves,
+		&puzzle.Rating,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query random puzzle: %w", err)
+	}
+
+	return &puzzle, nil
 }
