@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -67,6 +68,7 @@ func main() {
 
 	r.Get("/health", handleHealth)
 	r.Get("/puzzle", handleGetPuzzle(db, logger))
+	r.Get("/puzzle/daily", handleGetDailyPuzzle(db, logger))
 
 	addr := ":3000"
 	logger.Info("server starting", slog.String("addr", addr))
@@ -151,6 +153,73 @@ func getRandomPuzzle(db *sql.DB) (*Puzzle, error) {
 	)
 	if err != nil {
 		return nil, fmt.Errorf("query random puzzle: %w", err)
+	}
+
+	return &puzzle, nil
+}
+
+func handleGetDailyPuzzle(db *sql.DB, logger *slog.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		puzzle, err := getDailyPuzzle(r.Context(), db, SeedFromTodayUTC())
+		if err != nil {
+			httplog.SetError(r.Context(), err)
+			logger.ErrorContext(
+				r.Context(),
+				"failed to get daily puzzle",
+				slog.String("error", err.Error()),
+			)
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(puzzle); err != nil {
+			httplog.SetError(r.Context(), err)
+			logger.ErrorContext(
+				r.Context(),
+				"failed to encode daily puzzle response",
+				slog.String("error", err.Error()),
+			)
+		}
+	}
+}
+
+func SeedFromTodayUTC() int64 {
+	now := time.Now().UTC()
+	date := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+	return date.Unix() / 86400
+}
+
+func getDailyPuzzle(ctx context.Context, db *sql.DB, seed int64) (_ *Puzzle, err error) {
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, fmt.Errorf("begin daily puzzle transaction: %w", err)
+	}
+	defer func() {
+		if rollbackErr := tx.Rollback(); err == nil && rollbackErr != nil && rollbackErr != sql.ErrTxDone {
+			err = fmt.Errorf("rollback daily puzzle transaction: %w", rollbackErr)
+		}
+	}()
+
+	// PostgreSQL setseed accepts values from -1 through 1. This mapping keeps
+	// each UTC day distinct for more than 5,000 years before repeating.
+	postgresSeed := float64(seed%2_000_001-1_000_000) / 1_000_000
+	if _, err := tx.ExecContext(ctx, `SELECT setseed($1)`, postgresSeed); err != nil {
+		return nil, fmt.Errorf("seed random generator: %w", err)
+	}
+
+	var puzzle Puzzle
+	if err := tx.QueryRowContext(ctx, `
+		SELECT puzzle_id, fen, moves, rating
+		FROM lichess_puzzles
+		ORDER BY RANDOM()
+		LIMIT 1
+	`).Scan(&puzzle.ID, &puzzle.FEN, &puzzle.Moves, &puzzle.Rating); err != nil {
+		return nil, fmt.Errorf("query daily puzzle: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit daily puzzle transaction: %w", err)
 	}
 
 	return &puzzle, nil
