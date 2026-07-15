@@ -18,11 +18,8 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/httplog/v3"
 	"github.com/joho/godotenv"
-	_ "github.com/lib/pq"
 	_ "modernc.org/sqlite"
 )
-
-const migrationName = "postgresql-to-sqlite-v1"
 
 type Puzzle struct {
 	ID     string `json:"id"`
@@ -43,7 +40,7 @@ func main() {
 		sqlitePath = "./data/chess.db"
 	}
 	if err := ensureSQLiteDatabase(context.Background(), sqlitePath); err != nil {
-		logger.Error("failed to prepare sqlite database", slog.String("error", err.Error()))
+		logger.Error("failed to initialize sqlite database", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
 
@@ -69,9 +66,7 @@ func main() {
 	}
 }
 
-// ensureSQLiteDatabase creates the local database once. A completed migration
-// marker is written in the same transaction as the imported puzzle data, so a
-// failed import is safely retried on the next start.
+// ensureSQLiteDatabase creates the local database and its schema when needed.
 func ensureSQLiteDatabase(ctx context.Context, path string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("create sqlite directory: %w", err)
@@ -83,22 +78,7 @@ func ensureSQLiteDatabase(ctx context.Context, path string) error {
 	}
 	defer db.Close()
 
-	if err := createSQLiteSchema(ctx, db); err != nil {
-		return err
-	}
-	migrated, err := sqliteMigrated(ctx, db)
-	if err != nil {
-		return err
-	}
-	if migrated {
-		return nil
-	}
-
-	postgresURL := os.Getenv("DB_URL")
-	if postgresURL == "" {
-		return errors.New("DB_URL must be set until the PostgreSQL data has been migrated")
-	}
-	return migratePostgresToSQLite(ctx, db, postgresURL)
+	return createSQLiteSchema(ctx, db)
 }
 
 func openSQLite(path string) (*sql.DB, error) {
@@ -120,70 +100,9 @@ func createSQLiteSchema(ctx context.Context, db *sql.DB) error {
 			moves TEXT NOT NULL,
 			rating INTEGER NOT NULL
 		);
-		CREATE TABLE IF NOT EXISTS migration_metadata (
-			name TEXT PRIMARY KEY,
-			completed_at TEXT NOT NULL
-		);
 	`)
 	if err != nil {
 		return fmt.Errorf("create sqlite schema: %w", err)
-	}
-	return nil
-}
-
-func sqliteMigrated(ctx context.Context, db *sql.DB) (bool, error) {
-	var exists bool
-	err := db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM migration_metadata WHERE name = ?)`, migrationName).Scan(&exists)
-	if err != nil {
-		return false, fmt.Errorf("check migration status: %w", err)
-	}
-	return exists, nil
-}
-
-func migratePostgresToSQLite(ctx context.Context, sqliteDB *sql.DB, postgresURL string) error {
-	postgresDB, err := sql.Open("postgres", postgresURL)
-	if err != nil {
-		return fmt.Errorf("open PostgreSQL database: %w", err)
-	}
-	defer postgresDB.Close()
-	if err := postgresDB.PingContext(ctx); err != nil {
-		return fmt.Errorf("ping PostgreSQL database: %w", err)
-	}
-
-	rows, err := postgresDB.QueryContext(ctx, `SELECT puzzle_id, fen, moves, rating FROM lichess_puzzles`)
-	if err != nil {
-		return fmt.Errorf("read PostgreSQL puzzles: %w", err)
-	}
-	defer rows.Close()
-
-	tx, err := sqliteDB.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin sqlite migration: %w", err)
-	}
-	defer tx.Rollback()
-	insert, err := tx.PrepareContext(ctx, `INSERT INTO lichess_puzzles (puzzle_id, fen, moves, rating) VALUES (?, ?, ?, ?)`)
-	if err != nil {
-		return fmt.Errorf("prepare sqlite puzzle insert: %w", err)
-	}
-	defer insert.Close()
-
-	for rows.Next() {
-		var puzzle Puzzle
-		if err := rows.Scan(&puzzle.ID, &puzzle.FEN, &puzzle.Moves, &puzzle.Rating); err != nil {
-			return fmt.Errorf("scan PostgreSQL puzzle: %w", err)
-		}
-		if _, err := insert.ExecContext(ctx, puzzle.ID, puzzle.FEN, puzzle.Moves, puzzle.Rating); err != nil {
-			return fmt.Errorf("insert sqlite puzzle: %w", err)
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("iterate PostgreSQL puzzles: %w", err)
-	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO migration_metadata (name, completed_at) VALUES (?, ?)`, migrationName, time.Now().UTC().Format(time.RFC3339)); err != nil {
-		return fmt.Errorf("record migration completion: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit sqlite migration: %w", err)
 	}
 	return nil
 }

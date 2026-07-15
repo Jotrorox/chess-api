@@ -6,7 +6,6 @@ require (
 	github.com/go-chi/chi/v5 v5.3.0
 	github.com/go-chi/httplog/v3 v3.4.0
 	github.com/joho/godotenv v1.5.1
-	github.com/lib/pq v1.12.3
 	modernc.org/sqlite v1.53.0
 )
 
