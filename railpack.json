@@ -1,0 +1,15 @@
+{
+  "$schema": "https://schema.railpack.com",
+  "provider": "cpp",
+  "deploy": {
+    "startCommand": "/build/server",
+    "inputs": [
+      "...",
+      {
+        "local": true,
+        "include": ["."]
+      }
+    ],
+    "aptPackages": ["curl", "zstd"]
+  }
+}
