@@ -3,9 +3,15 @@
 #include "logger.hpp"
 
 #include <array>
+#include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <limits>
+#include <memory>
+#include <random>
+#include <sstream>
 #include <sqlite3.h>
 #include <stdexcept>
 #include <string>
@@ -23,7 +29,9 @@ public:
             std::filesystem::create_directories(parent);
         }
         if (sqlite3_open_v2(path.c_str(), &handle_,
-                            SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) != SQLITE_OK) {
+                            SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE |
+                                SQLITE_OPEN_FULLMUTEX,
+                            nullptr) != SQLITE_OK) {
             const std::string message = handle_ ? sqlite3_errmsg(handle_) : "unknown error";
             if (handle_) sqlite3_close(handle_);
             handle_ = nullptr;
@@ -49,6 +57,114 @@ public:
 
 private:
     sqlite3* handle_ = nullptr;
+};
+
+class SqliteStatement {
+public:
+    SqliteStatement(sqlite3* database, const char* sql) {
+        if (sqlite3_prepare_v2(database, sql, -1, &handle_, nullptr) != SQLITE_OK) {
+            throw std::runtime_error(sqlite3_errmsg(database));
+        }
+    }
+
+    ~SqliteStatement() { sqlite3_finalize(handle_); }
+    SqliteStatement(const SqliteStatement&) = delete;
+    SqliteStatement& operator=(const SqliteStatement&) = delete;
+    sqlite3_stmt* get() const { return handle_; }
+
+private:
+    sqlite3_stmt* handle_ = nullptr;
+};
+
+std::string json_string(const unsigned char* value) {
+    const std::string_view input = value
+        ? reinterpret_cast<const char*>(value)
+        : "";
+    std::ostringstream output;
+    output << '"';
+    for (const unsigned char character : input) {
+        switch (character) {
+            case '"': output << "\\\""; break;
+            case '\\': output << "\\\\"; break;
+            case '\b': output << "\\b"; break;
+            case '\f': output << "\\f"; break;
+            case '\n': output << "\\n"; break;
+            case '\r': output << "\\r"; break;
+            case '\t': output << "\\t"; break;
+            default:
+                if (character < 0x20) {
+                    constexpr char hex[] = "0123456789abcdef";
+                    output << "\\u00" << hex[character >> 4] << hex[character & 0xf];
+                } else {
+                    output << static_cast<char>(character);
+                }
+        }
+    }
+    output << '"';
+    return output.str();
+}
+
+class PuzzleRepository {
+public:
+    explicit PuzzleRepository(const std::filesystem::path& path) : database_(path) {
+        SqliteStatement statement(database_.get(), "SELECT COUNT(*) FROM puzzles");
+        if (sqlite3_step(statement.get()) != SQLITE_ROW) {
+            throw std::runtime_error(sqlite3_errmsg(database_.get()));
+        }
+        count_ = sqlite3_column_int64(statement.get(), 0);
+        if (count_ <= 0) throw std::runtime_error("Puzzle database is empty");
+    }
+
+    std::string random_puzzle() const {
+        thread_local std::mt19937_64 generator(std::random_device{}());
+        std::uniform_int_distribution<std::int64_t> distribution(0, count_ - 1);
+        return puzzle_at(distribution(generator));
+    }
+
+    std::string daily_puzzle() const {
+        using namespace std::chrono;
+        const auto utc_day = duration_cast<hours>(
+            system_clock::now().time_since_epoch()).count() / 24;
+        return puzzle_at(stable_hash(static_cast<std::uint64_t>(utc_day)) % count_);
+    }
+
+private:
+    static std::uint64_t stable_hash(std::uint64_t value) {
+        // SplitMix64 gives a stable, well-distributed mapping from UTC day to offset.
+        value += 0x9e3779b97f4a7c15ULL;
+        value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
+        value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
+        return value ^ (value >> 31);
+    }
+
+    std::string puzzle_at(std::int64_t offset) const {
+        constexpr char sql[] =
+            "SELECT puzzle_id, fen, moves, rating, rating_deviation, popularity, "
+            "play_count, themes, game_url, opening_tags "
+            "FROM puzzles ORDER BY puzzle_id LIMIT 1 OFFSET ?";
+        SqliteStatement statement(database_.get(), sql);
+        if (sqlite3_bind_int64(statement.get(), 1, offset) != SQLITE_OK ||
+            sqlite3_step(statement.get()) != SQLITE_ROW) {
+            throw std::runtime_error(sqlite3_errmsg(database_.get()));
+        }
+
+        std::ostringstream json;
+        json << "{\"id\":" << json_string(sqlite3_column_text(statement.get(), 0))
+             << ",\"fen\":" << json_string(sqlite3_column_text(statement.get(), 1))
+             << ",\"moves\":" << json_string(sqlite3_column_text(statement.get(), 2))
+             << ",\"rating\":" << sqlite3_column_int(statement.get(), 3)
+             << ",\"ratingDeviation\":" << sqlite3_column_int(statement.get(), 4)
+             << ",\"popularity\":" << sqlite3_column_int(statement.get(), 5)
+             << ",\"playCount\":" << sqlite3_column_int64(statement.get(), 6)
+             << ",\"themes\":" << json_string(sqlite3_column_text(statement.get(), 7))
+             << ",\"gameUrl\":" << json_string(sqlite3_column_text(statement.get(), 8))
+             << ",\"openingTags\":" << json_string(sqlite3_column_text(statement.get(), 9))
+             << '}';
+        return json.str();
+    }
+
+    SqliteDatabase database_;
+    std::int64_t count_ = 0;
 };
 
 // Reads exactly one RFC 4180-style record without retaining any previous records.
@@ -300,6 +416,7 @@ int main() {
         return EXIT_FAILURE;
     }
 
+    std::unique_ptr<PuzzleRepository> puzzles;
     try {
         download_puzzle_database(download_path_env);
         unpack_puzzle_database(download_path_env);
@@ -311,6 +428,7 @@ int main() {
             throw std::runtime_error("SQLITE_DB_PATH must be set");
         }
         populate_database_if_empty(csv_path, database_path_env);
+        puzzles = std::make_unique<PuzzleRepository>(database_path_env);
     } catch (const std::exception& error) {
         SLOG_ERROR(error.what());
         return EXIT_FAILURE;
@@ -320,6 +438,28 @@ int main() {
 
     svr.Get("/", [](const httplib::Request&, httplib::Response& res){
         res.set_content("Hello!", "text/plain");
+    });
+
+    const auto serve_puzzle = [&puzzles](bool daily, httplib::Response& response) {
+        try {
+            response.set_content(
+                daily ? puzzles->daily_puzzle() : puzzles->random_puzzle(),
+                "application/json"
+            );
+            response.set_header("Cache-Control", daily ? "public, max-age=300" : "no-store");
+        } catch (const std::exception& error) {
+            SLOG_ERROR("Unable to retrieve puzzle: ", error.what());
+            response.status = 500;
+            response.set_content("{\"error\":\"Unable to retrieve puzzle\"}",
+                                 "application/json");
+        }
+    };
+
+    svr.Get("/puzzle", [&serve_puzzle](const httplib::Request&, httplib::Response& response) {
+        serve_puzzle(false, response);
+    });
+    svr.Get("/puzzle/daily", [&serve_puzzle](const httplib::Request&, httplib::Response& response) {
+        serve_puzzle(true, response);
     });
 
     const char* port_env = std::getenv("PORT");
