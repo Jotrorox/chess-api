@@ -128,6 +128,13 @@ public:
         return puzzle_at(stable_hash(static_cast<std::uint64_t>(utc_day)) % count_);
     }
 
+    std::int64_t count() const { return count_; }
+
+    bool is_healthy() const {
+        SqliteStatement statement(database_.get(), "SELECT 1 FROM puzzles LIMIT 1");
+        return sqlite3_step(statement.get()) == SQLITE_ROW;
+    }
+
 private:
     static std::uint64_t stable_hash(std::uint64_t value) {
         // SplitMix64 gives a stable, well-distributed mapping from UTC day to offset.
@@ -438,6 +445,30 @@ int main() {
 
     svr.Get("/", [](const httplib::Request&, httplib::Response& res){
         res.set_content("Hello!", "text/plain");
+    });
+
+    svr.Get("/health", [](const httplib::Request&, httplib::Response& response) {
+        response.set_content("ok", "text/plain");
+    });
+
+    svr.Get("/status", [&puzzles](const httplib::Request&, httplib::Response& response) {
+        try {
+            const bool healthy = puzzles->is_healthy();
+            response.status = healthy ? 200 : 503;
+            response.set_content(
+                "{\"status\":\"" + std::string(healthy ? "ok" : "error") +
+                    "\",\"puzzlesLoaded\":" + std::to_string(puzzles->count()) + "}",
+                "application/json"
+            );
+        } catch (const std::exception& error) {
+            SLOG_ERROR("Unable to determine service status: ", error.what());
+            response.status = 503;
+            response.set_content(
+                "{\"status\":\"error\",\"puzzlesLoaded\":" +
+                    std::to_string(puzzles->count()) + "}",
+                "application/json"
+            );
+        }
     });
 
     const auto serve_puzzle = [&puzzles](bool daily, httplib::Response& response) {
