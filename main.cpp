@@ -91,8 +91,8 @@ void unpack_puzzle_database(const std::filesystem::path& archive_path) {
 
     if (pid == 0) {
         execlp(
-            "zstd", "zstd", "--decompress", "--output",
-            temporary_path.c_str(), archive_path.c_str(),
+            "zstd", "zstd", "--decompress", archive_path.c_str(),
+            "-o", temporary_path.c_str(),
             static_cast<char*>(nullptr)
         );
         _exit(EXIT_FAILURE);
