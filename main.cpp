@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <fcntl.h>
 #include <fstream>
 #include <limits>
 #include <memory>
@@ -107,9 +108,13 @@ std::string json_string(const unsigned char* value) {
 class PuzzleRepository {
 public:
     explicit PuzzleRepository(const std::filesystem::path& path) : database_(path) {
-        SqliteStatement statement(database_.get(), "SELECT COUNT(*) FROM puzzles");
+        database_.execute("PRAGMA cache_size=-1024;PRAGMA mmap_size=0;");
+        SqliteStatement statement(
+            database_.get(),
+            "SELECT value FROM app_metadata WHERE key = 'puzzle_count'"
+        );
         if (sqlite3_step(statement.get()) != SQLITE_ROW) {
-            throw std::runtime_error(sqlite3_errmsg(database_.get()));
+            throw std::runtime_error("Puzzle count metadata is missing");
         }
         count_ = sqlite3_column_int64(statement.get(), 0);
         if (count_ <= 0) throw std::runtime_error("Puzzle database is empty");
@@ -117,15 +122,15 @@ public:
 
     std::string random_puzzle() const {
         thread_local std::mt19937_64 generator(std::random_device{}());
-        std::uniform_int_distribution<std::int64_t> distribution(0, count_ - 1);
-        return puzzle_at(distribution(generator));
+        return puzzle_at_or_after(random_key(generator));
     }
 
     std::string daily_puzzle() const {
         using namespace std::chrono;
         const auto utc_day = duration_cast<hours>(
             system_clock::now().time_since_epoch()).count() / 24;
-        return puzzle_at(stable_hash(static_cast<std::uint64_t>(utc_day)) % count_);
+        std::mt19937_64 generator(stable_hash(static_cast<std::uint64_t>(utc_day)));
+        return puzzle_at_or_after(random_key(generator));
     }
 
     std::int64_t count() const { return count_; }
@@ -136,6 +141,17 @@ public:
     }
 
 private:
+    static std::string random_key(std::mt19937_64& generator) {
+        // Puzzle IDs use ASCII-ordered base62 characters. Seeking to a random
+        // key keeps selection indexed instead of scanning millions of rows.
+        constexpr char alphabet[] =
+            "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+        std::uniform_int_distribution<std::size_t> distribution(0, 61);
+        std::string key(5, '0');
+        for (char& character : key) character = alphabet[distribution(generator)];
+        return key;
+    }
+
     static std::uint64_t stable_hash(std::uint64_t value) {
         // SplitMix64 gives a stable, well-distributed mapping from UTC day to offset.
         value += 0x9e3779b97f4a7c15ULL;
@@ -144,28 +160,50 @@ private:
         return value ^ (value >> 31);
     }
 
-    std::string puzzle_at(std::int64_t offset) const {
+    std::string puzzle_at_or_after(const std::string& puzzle_id) const {
         constexpr char sql[] =
             "SELECT puzzle_id, fen, moves, rating, rating_deviation, popularity, "
             "play_count, themes, game_url, opening_tags "
-            "FROM puzzles ORDER BY puzzle_id LIMIT 1 OFFSET ?";
+            "FROM puzzles WHERE puzzle_id >= ? ORDER BY puzzle_id LIMIT 1";
         SqliteStatement statement(database_.get(), sql);
-        if (sqlite3_bind_int64(statement.get(), 1, offset) != SQLITE_OK ||
-            sqlite3_step(statement.get()) != SQLITE_ROW) {
+        if (sqlite3_bind_text(statement.get(), 1, puzzle_id.data(),
+                              static_cast<int>(puzzle_id.size()), SQLITE_TRANSIENT) != SQLITE_OK) {
             throw std::runtime_error(sqlite3_errmsg(database_.get()));
         }
 
+        int result = sqlite3_step(statement.get());
+        if (result == SQLITE_DONE) {
+            return first_puzzle();
+        }
+        if (result != SQLITE_ROW) throw std::runtime_error(sqlite3_errmsg(database_.get()));
+
+        return puzzle_json(statement.get());
+    }
+
+    std::string first_puzzle() const {
+        constexpr char sql[] =
+            "SELECT puzzle_id, fen, moves, rating, rating_deviation, popularity, "
+            "play_count, themes, game_url, opening_tags "
+            "FROM puzzles ORDER BY puzzle_id LIMIT 1";
+        SqliteStatement statement(database_.get(), sql);
+        if (sqlite3_step(statement.get()) != SQLITE_ROW) {
+            throw std::runtime_error(sqlite3_errmsg(database_.get()));
+        }
+        return puzzle_json(statement.get());
+    }
+
+    static std::string puzzle_json(sqlite3_stmt* statement) {
         std::ostringstream json;
-        json << "{\"id\":" << json_string(sqlite3_column_text(statement.get(), 0))
-             << ",\"fen\":" << json_string(sqlite3_column_text(statement.get(), 1))
-             << ",\"moves\":" << json_string(sqlite3_column_text(statement.get(), 2))
-             << ",\"rating\":" << sqlite3_column_int(statement.get(), 3)
-             << ",\"ratingDeviation\":" << sqlite3_column_int(statement.get(), 4)
-             << ",\"popularity\":" << sqlite3_column_int(statement.get(), 5)
-             << ",\"playCount\":" << sqlite3_column_int64(statement.get(), 6)
-             << ",\"themes\":" << json_string(sqlite3_column_text(statement.get(), 7))
-             << ",\"gameUrl\":" << json_string(sqlite3_column_text(statement.get(), 8))
-             << ",\"openingTags\":" << json_string(sqlite3_column_text(statement.get(), 9))
+        json << "{\"id\":" << json_string(sqlite3_column_text(statement, 0))
+             << ",\"fen\":" << json_string(sqlite3_column_text(statement, 1))
+             << ",\"moves\":" << json_string(sqlite3_column_text(statement, 2))
+             << ",\"rating\":" << sqlite3_column_int(statement, 3)
+             << ",\"ratingDeviation\":" << sqlite3_column_int(statement, 4)
+             << ",\"popularity\":" << sqlite3_column_int(statement, 5)
+             << ",\"playCount\":" << sqlite3_column_int64(statement, 6)
+             << ",\"themes\":" << json_string(sqlite3_column_text(statement, 7))
+             << ",\"gameUrl\":" << json_string(sqlite3_column_text(statement, 8))
+             << ",\"openingTags\":" << json_string(sqlite3_column_text(statement, 9))
              << '}';
         return json.str();
     }
@@ -222,6 +260,13 @@ bool is_header(const std::array<std::string, 10>& fields) {
     return fields[0] == "PuzzleId" && fields[1] == "FEN" && fields[2] == "Moves";
 }
 
+void discard_file_cache(const std::filesystem::path& path) {
+    const int descriptor = open(path.c_str(), O_RDONLY);
+    if (descriptor == -1) return;
+    posix_fadvise(descriptor, 0, 0, POSIX_FADV_DONTNEED);
+    close(descriptor);
+}
+
 void populate_database_if_empty(const std::filesystem::path& csv_path,
                                 const std::filesystem::path& database_path) {
     if (!std::filesystem::is_regular_file(csv_path)) {
@@ -243,6 +288,9 @@ void populate_database_if_empty(const std::filesystem::path& csv_path,
         "popularity INTEGER NOT NULL, play_count INTEGER NOT NULL,"
         "themes TEXT NOT NULL, game_url TEXT NOT NULL, opening_tags TEXT NOT NULL"
         ") WITHOUT ROWID;"
+        "CREATE TABLE IF NOT EXISTS app_metadata ("
+        "key TEXT PRIMARY KEY NOT NULL, value INTEGER NOT NULL"
+        ") WITHOUT ROWID;"
     );
 
     sqlite3_stmt* count_statement = nullptr;
@@ -253,6 +301,18 @@ void populate_database_if_empty(const std::filesystem::path& csv_path,
     const bool populated = sqlite3_step(count_statement) == SQLITE_ROW;
     sqlite3_finalize(count_statement);
     if (populated) {
+        SqliteStatement metadata_statement(
+            database.get(),
+            "SELECT 1 FROM app_metadata WHERE key = 'puzzle_count'"
+        );
+        if (sqlite3_step(metadata_statement.get()) != SQLITE_ROW) {
+            database.execute(
+                "INSERT INTO app_metadata(key, value) "
+                "SELECT 'puzzle_count', COUNT(*) FROM puzzles;"
+                "PRAGMA shrink_memory;"
+            );
+            discard_file_cache(database_path);
+        }
         SLOG_INFO("SQLite database is already populated; skipping CSV import");
         return;
     }
@@ -289,6 +349,15 @@ void populate_database_if_empty(const std::filesystem::path& csv_path,
             if (imported % 1000000 == 0) SLOG_INFO("Imported puzzles: ", imported);
         }
         if (imported == 0) throw std::runtime_error("CSV contains no puzzle records");
+        SqliteStatement metadata_statement(
+            database.get(),
+            "INSERT OR REPLACE INTO app_metadata(key, value) VALUES ('puzzle_count', ?)"
+        );
+        if (sqlite3_bind_int64(metadata_statement.get(), 1,
+                               static_cast<sqlite3_int64>(imported)) != SQLITE_OK ||
+            sqlite3_step(metadata_statement.get()) != SQLITE_DONE) {
+            throw std::runtime_error(sqlite3_errmsg(database.get()));
+        }
         database.execute("COMMIT");
     } catch (...) {
         sqlite3_finalize(statement);
